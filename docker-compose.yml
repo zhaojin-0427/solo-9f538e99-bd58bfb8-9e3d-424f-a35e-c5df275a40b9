@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: dp-case-release:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/dp.db
+    volumes:
+      - dp_data:/data
+    restart: unless-stopped
+
+volumes:
+  dp_data:
