@@ -65,8 +65,11 @@ def make_client(sampler=None, db=None, **kw):
     return tmp, app, TestClient(app, **kw)
 
 
-def post_csv(client, text):
-    return client.post("/upload", files={"file": ("data.csv", text.encode("utf-8"), "text/csv")})
+def post_csv(client, text, batch_id=None):
+    data = {"file": ("data.csv", text.encode("utf-8"), "text/csv")}
+    if batch_id is not None:
+        data["batch_id"] = (None, batch_id)
+    return client.post("/upload", files=data)
 
 
 def pub(client, key, date, eps):
@@ -291,5 +294,265 @@ check("无数据日期发布全零", r.status_code == 200
 check("按日期过滤查询", len(c.get("/releases", params={"date": "2026-10-30"}).json()["releases"]) == 1)
 check("非法日期查询被拒(400)", c.get("/budget/2026-13-40").status_code == 400)
 check("不存在的发布键 404", c.get("/releases/NOPE").status_code == 404)
+
+# ---------- 16. 批次上传：同批同内容沿用、同批异文冲突、多批来源并存 ----------
+tmp, app, c = make_client(sampler=ZeroSampler())
+csv_a = f"{D1},P1,东,1\n{D1},P2,西,1\n"
+csv_b = f"{D1},P1,西,2\n{D1},P3,南,1\n"
+r = post_csv(c, csv_a, batch_id="B1")
+check("带批次号上传成功", r.status_code == 200 and r.json()["batch_id"] == "B1"
+      and r.json()["batch_reused"] is False and r.json()["inserted"] == 2, r.text)
+created = r.json()["batch_created_at"]
+r = post_csv(c, csv_a, batch_id="B1")
+check("同批同内容重试沿用原批次", r.status_code == 200
+      and r.json()["batch_reused"] is True and r.json()["inserted"] == 0
+      and r.json()["batch_created_at"] == created, r.text)
+r = post_csv(c, f"{D1},P1,东,1\n", batch_id="B1")
+check("同批异文冲突(409)", r.status_code == 409, r.text)
+check("同批异文整批未入库", len(c.get("/batches").json()["batches"]) == 1)
+r = post_csv(c, csv_b, batch_id="B2")
+check("第二批上传成功", r.status_code == 200 and r.json()["inserted"] == 2, r.text)
+r = post_csv(c, csv_b, batch_id="B3")
+check("相同记录来自不同批次仍保留各自来源", r.status_code == 200
+      and r.json()["batch_id"] == "B3" and r.json()["skipped_duplicates"] == 2, r.text)
+prov = app.state.store.dump_provenance()
+p1r2 = [p["batch_id"] for p in prov if p["patient_id"] == "P1" and p["revision"] == 2]
+check("同一记录关联多个批次来源", sorted(p1r2) == ["B2", "B3"], p1r2)
+r = c.post("/upload", files={"file": ("d.csv", f"{D1},P1,东,1\n".encode(), "text/csv")},
+           data={"batch_id": "B1"})
+check("批次号也可用表单字段提供", r.status_code == 409, r.text)
+r = c.post("/upload", files={"file": ("d.csv", f"{D1},P1,东,1\n".encode(), "text/csv")},
+           headers={"X-Batch-Id": "B1"})
+check("批次号也可用请求头提供", r.status_code == 409, r.text)
+r = post_csv(c, f"{D1},P4,东,1\n")
+check("不传批次号时服务端生成", r.status_code == 200
+      and r.json()["batch_id"].startswith("batch-"), r.text)
+check("上传结果含批次隔离状态", r.json()["batch_isolated"] is False)
+r = post_csv(c, f"{D1},P2,东,1\n{D1},P5,东,1\n", batch_id="B9")
+check("冲突批次整批拒绝", r.status_code == 409, r.text)
+check("被拒批次不留下批次元数据",
+      [b["batch_id"] for b in c.get("/batches").json()["batches"]].count("B9") == 0)
+check("被拒批次中的合法行也未入库",
+      all(rec["patient_id"] != "P5" for rec in app.state.store.dump_records()))
+c.post("/batches/B2/isolate")
+r = post_csv(c, csv_b, batch_id="B2")
+check("已隔离批次同内容重试仍沿用原批且保持隔离", r.status_code == 200
+      and r.json()["batch_reused"] is True and r.json()["batch_isolated"] is True, r.text)
+check("隔离 B2 后相同记录仍由 B3 供数",
+      app.state.store.snapshot_counts(D1) == {"东": 1, "西": 2, "南": 1},
+      app.state.store.snapshot_counts(D1))
+c.post("/batches/B3/isolate")
+check("全部来源隔离后这些记录退出统计",
+      app.state.store.snapshot_counts(D1) == {"东": 2, "西": 1, "南": 0},
+      app.state.store.snapshot_counts(D1))
+check("已隔离批次不因重试恢复供数",
+      app.state.store.snapshot_counts(D1) == {"东": 2, "西": 1, "南": 0},
+      app.state.store.snapshot_counts(D1))
+
+# ---------- 17. 隔离：既有发布不变、新发布重选来源、受影响清单 ----------
+tmp, app, c = make_client(sampler=ZeroSampler())
+post_csv(c, f"{D1},P1,东,1\n{D1},P2,西,1\n", batch_id="S1")
+post_csv(c, f"{D1},P1,西,2\n{D1},P3,南,1\n", batch_id="S2")
+check("隔离前快照取各患者最高修订",
+      app.state.store.snapshot_counts(D1) == {"东": 0, "西": 2, "南": 1},
+      app.state.store.snapshot_counts(D1))
+j1 = pub(c, "REL1", D1, "0.4").json()
+check("发布记录来源批次", j1["sources"] == ["S1", "S2"] and j1["source_known"] is True, j1)
+check("发布键可按来源批次反查",
+      [x["release_key"] for x in c.get("/releases", params={"batch_id": "S2"}).json()["releases"]] == ["REL1"])
+r = c.post("/batches/S2/isolate")
+j = r.json()
+check("隔离成功并列出受影响发布键", r.status_code == 200
+      and j["isolated"] is True and j["already_isolated"] is False
+      and j["affected_release_keys"] == ["REL1"], r.text)
+check("隔离幂等", c.post("/batches/S2/isolate").json()["already_isolated"] is True)
+check("隔离不存在的批次 404", c.post("/batches/NOPE/isolate").status_code == 404)
+check("隔离后旧发布数值不变", c.get("/releases/REL1").json()["counts"] == j1["counts"])
+check("隔离不改已用预算", c.get(f"/budget/{D1}").json()["used"] == "0.4")
+check("隔离后快照按未隔离来源重选最高修订",
+      app.state.store.snapshot_counts(D1) == {"东": 1, "西": 1, "南": 0},
+      app.state.store.snapshot_counts(D1))
+j2 = pub(c, "REL2", D1, "0.4").json()
+check("隔离后新发布按未隔离来源计数",
+      j2["counts"] == {"东": 1, "西": 1, "南": 0, "全市": 2}, j2)
+check("新发布不再采用已隔离批次", j2["sources"] == ["S1"], j2)
+check("已隔离批次不进入新发布受影响清单",
+      "REL2" not in c.get("/batches/S2").json()["affected_release_keys"])
+check("批次详情列出受影响发布键与记录数",
+      c.get("/batches/S2").json()["affected_release_keys"] == ["REL1"]
+      and c.get("/batches/S2").json()["record_count"] == 2)
+br = c.get("/batches/S2/releases").json()
+check("受影响发布明细含原数值", len(br["releases"]) == 1
+      and br["releases"][0]["counts"] == j1["counts"], br)
+check("批次列表反映隔离状态", [b["batch_id"] for b in c.get("/batches").json()["batches"]
+                                if b["isolated"]] == ["S2"])
+check("隔离后预算照常扣减", c.get(f"/budget/{D1}").json()["used"] == "0.8")
+
+# ---------- 18. 部分来源隔离：仍有未隔离来源时记录继续供数 ----------
+tmp, app, c = make_client(sampler=ZeroSampler())
+post_csv(c, f"{D1},P1,东,1\n", batch_id="M1")
+post_csv(c, f"{D1},P1,东,1\n", batch_id="M2")
+j = pub(c, "MK", D1, "0.2").json()
+check("多来源记录的发布快照含全部未隔离来源", j["sources"] == ["M1", "M2"], j)
+c.post("/batches/M1/isolate")
+check("仅隔离其一时记录仍供数",
+      app.state.store.snapshot_counts(D1) == {"东": 1, "西": 0, "南": 0},
+      app.state.store.snapshot_counts(D1))
+j2 = pub(c, "MK2", D1, "0.2").json()
+check("仍有未隔离来源时新发布继续采用", j2["counts"]["东"] == 1 and j2["sources"] == ["M2"], j2)
+c.post("/batches/M2/isolate")
+check("全部来源隔离后记录退出统计",
+      app.state.store.snapshot_counts(D1) == {"东": 0, "西": 0, "南": 0},
+      app.state.store.snapshot_counts(D1))
+check("两次隔离的受影响清单各自独立",
+      c.get("/batches/M1").json()["affected_release_keys"] == ["MK"]
+      and c.get("/batches/M2").json()["affected_release_keys"] == ["MK", "MK2"])
+
+# ---------- 19. 隔离失败回滚：不留部分隔离 ----------
+tmp, app, c = make_client(sampler=ZeroSampler(), raise_server_exceptions=False)
+post_csv(c, f"{D1},P1,东,1\n", batch_id="R1")
+pub(c, "RR", D1, "0.3")
+orig = app.state.store._affected_release_keys
+
+
+def boom(*a, **kw):
+    raise RuntimeError("模拟隔离中途故障")
+
+
+app.state.store._affected_release_keys = staticmethod(boom)
+r = c.post("/batches/R1/isolate", )
+check("隔离中途故障返回 500", r.status_code == 500, r.status_code)
+app.state.store._affected_release_keys = orig
+check("隔离失败不留部分隔离标记",
+      c.get("/batches/R1").json()["isolated"] is False, c.get("/batches/R1").json())
+check("隔离失败后原记录继续供数",
+      app.state.store.snapshot_counts(D1) == {"东": 1, "西": 0, "南": 0})
+r = c.post("/batches/R1/isolate")
+check("故障恢复后可正常隔离", r.status_code == 200
+      and r.json()["affected_release_keys"] == ["RR"], r.text)
+
+# ---------- 20. 既有无来源记录继续供数、旧发布来源标记未知 ----------
+import sqlite3  # noqa: E402
+
+tmpdir = tempfile.TemporaryDirectory()
+legacy_db = os.path.join(tmpdir.name, "legacy.db")
+conn = sqlite3.connect(legacy_db)
+conn.executescript(
+    """
+    CREATE TABLE records(date TEXT NOT NULL, patient_id TEXT NOT NULL, district TEXT NOT NULL,
+                         revision INTEGER NOT NULL, PRIMARY KEY(date, patient_id, revision));
+    CREATE TABLE budgets(date TEXT PRIMARY KEY, used TEXT NOT NULL DEFAULT '0');
+    CREATE TABLE releases(release_key TEXT PRIMARY KEY, date TEXT NOT NULL, epsilon TEXT NOT NULL,
+                          east INTEGER NOT NULL, west INTEGER NOT NULL, south INTEGER NOT NULL,
+                          citywide INTEGER NOT NULL, created_at TEXT NOT NULL);
+    """
+)
+conn.execute("INSERT INTO records VALUES(?,?,?,?)", (D1, "P1", "东", 1))
+conn.execute("INSERT INTO budgets VALUES(?,?)", (D1, "0.5"))
+conn.execute("INSERT INTO releases VALUES(?,?,?,?,?,?,?,?)",
+             ("LEGACY", D1, "0.5", 9, 0, 0, 9, "2026-01-01T00:00:00+00:00"))
+conn.commit()
+conn.close()
+app = create_app(legacy_db)
+app.state.sampler = ZeroSampler()
+with TestClient(app) as c:
+    old = c.get("/releases/LEGACY").json()
+    check("旧发布来源标记为未知", old["source_known"] is False and old["sources"] is None, old)
+    check("旧发布数值保持不变", old["counts"] == {"东": 9, "西": 0, "南": 0, "全市": 9}, old)
+    n = pub(c, "NEW", D1, "0.1").json()
+    check("无来源旧记录继续供数", n["counts"]["东"] == 1, n)
+    check("新发布来源已知但为空清单", n["source_known"] is True and n["sources"] == [], n)
+    post_csv(c, f"{D1},P2,南,1\n", batch_id="LX")
+    c.post("/batches/LX/isolate")
+    n2 = pub(c, "NEW2", D1, "0.1").json()
+    check("隔离新批次不影响无来源旧记录", n2["counts"]["东"] == 1 and n2["counts"]["南"] == 0, n2)
+    check("隔离响应提示来源未知的发布数",
+          c.post("/batches/LX/isolate").json()["unknown_provenance_release_count"] == 1)
+
+# ---------- 21. 跨连接交错：发布先提交 / 隔离先提交，均以完整已提交状态为准 ----------
+from app.store import Store  # noqa: E402
+
+
+class RawRow:
+    def __init__(self, date, patient_id, district, revision):
+        self.date, self.patient_id = date, patient_id
+        self.district, self.revision = district, revision
+
+
+tmpdir = tempfile.TemporaryDirectory()
+xdb = os.path.join(tmpdir.name, "x.db")
+wa, wb = Store(xdb), Store(xdb)
+wa.insert_batch([RawRow(D1, "P1", "东", 1)], batch_id="XB")
+started, release = threading.Event(), threading.Event()
+
+
+def blocking_noise(scale):
+    started.set()          # 发布已进入写事务、尚未提交
+    release.wait(5)
+    return 0.0
+
+
+cross: dict = {}
+
+
+def do_publish():
+    cross["pub"] = wa.publish("XK", D1, Decimal("0.2"), blocking_noise)
+
+
+def do_isolate():
+    started.wait(5)
+    cross["iso"] = wb.isolate_batch("XB")
+
+
+t1 = threading.Thread(target=do_publish)
+t2 = threading.Thread(target=do_isolate)
+t1.start(); t2.start()
+time.sleep(0.2); release.set()   # 让隔离在发布提交之后才拿到写锁
+t1.join(10); t2.join(10)
+check("交错：发布先提交时来源归属完整", cross["pub"][0]["sources"] == ["XB"], cross)
+check("交错：随后隔离把该发布列入受影响清单",
+      cross["iso"]["affected_release_keys"] == ["XK"], cross)
+check("交错：隔离后同批记录不再供数",
+      wa.snapshot_counts(D1) == {"东": 0, "西": 0, "南": 0}, wa.snapshot_counts(D1))
+check("交错：已发布数值与预算不变",
+      wb.get_release("XK")["counts"] == {"东": 1, "西": 0, "南": 0, "全市": 1}
+      and wb.get_budget(D1)["used"] == "0.2")
+
+# 反向：隔离先拿到写锁（持锁期间），发布随后提交 → 新发布不得采用该批
+y_a, y_b = wa, wb
+y_a.insert_batch([RawRow(D2, "P1", "东", 1)], batch_id="YB")
+iso_started, iso_go = threading.Event(), threading.Event()
+orig_affected = Store._affected_release_keys
+
+
+def slow_affected(cur, batch_id):
+    iso_started.set()
+    iso_go.wait(5)
+    return orig_affected(cur, batch_id)
+
+
+y_b._affected_release_keys = slow_affected
+
+
+def iso_first():
+    cross["iso2"] = y_b.isolate_batch("YB")
+
+
+def pub_after():
+    iso_started.wait(5)
+    cross["pub2"] = y_a.publish("YK", D2, Decimal("0.2"), lambda s: 0.0)
+
+
+t3 = threading.Thread(target=iso_first)
+t4 = threading.Thread(target=pub_after)
+t3.start(); t4.start()
+time.sleep(0.2); iso_go.set()    # 隔离先提交，发布事务在其后读快照
+t3.join(10); t4.join(10)
+check("反向交错：隔离先提交则新发布不采用该批", cross["pub2"][0]["sources"] == [], cross)
+check("反向交错：新发布按未隔离来源计数", cross["pub2"][0]["counts"]["东"] == 0, cross)
+check("反向交错：受影响清单不含后提交的发布",
+      cross["iso2"]["affected_release_keys"] == [], cross)
+y_b._affected_release_keys = orig_affected
+wa.close(); wb.close()
 
 print(f"\n全部 {len(DONE)} 项检查通过。")
